@@ -1,6 +1,9 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// The one addition below the env-var check is startup validation only: it rejects a malformed
+// MAKEFUN_ENV_URL at once (a typo would otherwise retry fetch forever) and logs the Node version,
+// pid and env origin for diagnostics. It changes nothing on the valid path.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
@@ -23,6 +26,24 @@ if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
+
+/**
+ * The env origin must be a well-formed http(s) URL. A bare hostname, a missing scheme or a typo
+ * would otherwise make every register and done request fail and retry forever without ever saying
+ * why, so reject it here with the offending value on stderr instead of looping silently.
+ */
+let ENV_ORIGIN: URL;
+try {
+  ENV_ORIGIN = new URL(ENV_URL);
+} catch {
+  process.stderr.write(`[entry] MAKEFUN_ENV_URL is not a valid URL: ${JSON.stringify(ENV_URL)}\n`);
+  process.exit(1);
+}
+if (ENV_ORIGIN.protocol !== 'http:' && ENV_ORIGIN.protocol !== 'https:') {
+  process.stderr.write(`[entry] MAKEFUN_ENV_URL must use http or https, got ${ENV_ORIGIN.protocol}\n`);
+  process.exit(1);
+}
+process.stdout.write(`[entry] node ${process.version} (pid ${process.pid}) talking to ${ENV_ORIGIN.origin}\n`);
 
 /** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
