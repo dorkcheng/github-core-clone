@@ -1,5 +1,9 @@
 # github-core-clone-01 — a single-process Node git forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/dorkcheng/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/dorkcheng/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone Node 22 git forge (one process, `main.ts` at the root) serving
 git smart HTTP v2, REST v3, GraphQL and MCP over its own in-memory store.
 No git binary, no network, no disk writes: the trial mounts the repo
@@ -40,3 +44,7 @@ Feature 600 + agent (MCP) 200 + perf ~170–177 = **~970–977 / 1000**,
 against a house baseline of ~900. Perf workloads vs reference
 (push 1640.82 ms, clone 266.941 ms, read 2759.715 ms, write 348.965 ms):
 push ~485–650 ms, clone ~102–166 ms, read ~646–868 ms, write ~108–149 ms.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=z7ynzx9d&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
