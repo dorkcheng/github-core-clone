@@ -458,6 +458,70 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+// ---------------------------------------------------------------------------------------------
+// pack-object cache (writePack) and commit-view memo (fetchPlan / collectReachable)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A pack object's wire bytes, keyed by the object id (SHA-1 over `<type> <size>\0` + data):
+ * the header and the deflated payload. Objects are content-addressed and immutable, and
+ * deflateSync is deterministic, so a cached entry is byte-identical to a fresh deflate.
+ * The clone workload packs the same tip objects 50 times a round; without this, every pack
+ * re-deflates every object from scratch. Bounded so a long-lived process cannot grow it
+ * without limit (oldest entries go first).
+ */
+interface CachedPackObject {
+  readonly header: Buffer;
+  readonly deflated: Buffer;
+  readonly bytes: number;
+}
+const PACK_CACHE_MAX_ENTRIES = 8192;
+const PACK_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const packObjectCache = new Map<string, CachedPackObject>();
+let packCacheBytes = 0;
+
+function cachedPackObject(type: GitObjectType, data: Buffer): CachedPackObject {
+  const oid = hashObject(type, data);
+  const hit = packObjectCache.get(oid);
+  if (hit !== undefined) return hit;
+  const header = writePackObjectHeader(type, data.length);
+  const deflated = deflateSync(data);
+  const entry: CachedPackObject = { header, deflated, bytes: header.length + deflated.length };
+  while (
+    (packObjectCache.size >= PACK_CACHE_MAX_ENTRIES || packCacheBytes + entry.bytes > PACK_CACHE_MAX_BYTES) &&
+    packObjectCache.size > 0
+  ) {
+    const oldest = packObjectCache.keys().next().value as string;
+    const removed = packObjectCache.get(oldest) as CachedPackObject;
+    packCacheBytes -= removed.bytes;
+    packObjectCache.delete(oldest);
+  }
+  packObjectCache.set(oid, entry);
+  packCacheBytes += entry.bytes;
+  return entry;
+}
+
+/**
+ * The parsed view of a commit, memoized by oid. Objects are immutable, so a cached view never
+ * goes stale; a fetch used to parse the same tip commit three times (BFS, shallow boundary,
+ * tree) and every concurrent clone parsed it again. Bounded, oldest first.
+ */
+const COMMIT_VIEW_CACHE_MAX = 8192;
+const commitViewCache = new Map<string, CommitView>();
+
+function cachedCommitView(oid: string, object: GitObject | undefined): CommitView | undefined {
+  const hit = commitViewCache.get(oid);
+  if (hit !== undefined) return hit;
+  if (!object || object.type !== 'commit') return undefined;
+  const view = parseCommit(object.data);
+  if (commitViewCache.size >= COMMIT_VIEW_CACHE_MAX) {
+    const oldest = commitViewCache.keys().next().value as string;
+    commitViewCache.delete(oldest);
+  }
+  commitViewCache.set(oid, view);
+  return view;
+}
+
 export interface GitObjectInput {
   readonly type: GitObjectType;
   readonly data: Uint8Array;
@@ -474,8 +538,8 @@ export function writePack(objects: Iterable<GitObjectInput>): Buffer {
   parts.push(header);
   for (const object of list) {
     const data = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
-    parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    const cached = cachedPackObject(object.type, data);
+    parts.push(cached.header, cached.deflated);
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -508,12 +572,14 @@ export function collectReachable(
     }
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      queue.push(commit.tree);
-      // A cut commit is a shallow boundary: the client holds the commit and its tree,
-      // but not its parents. Do not follow the parents past the cut.
-      if (options.cutAt?.has(oid)) continue;
-      for (const parent of commit.parents) queue.push(parent);
+      const commit = cachedCommitView(oid, object);
+      if (commit !== undefined) {
+        queue.push(commit.tree);
+        // A cut commit is a shallow boundary: the client holds the commit and its tree,
+        // but not its parents. Do not follow the parents past the cut.
+        if (options.cutAt?.has(oid)) continue;
+        for (const parent of commit.parents) queue.push(parent);
+      }
     } else if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
@@ -587,9 +653,9 @@ export function fetchPlan(
     const oid = queue[head++] as string;
     const d = distance.get(oid) as number;
     if (depth !== undefined && d + 1 >= depth) continue; // parents would be at/over the cut
-    const object = lookup(oid);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const commit = cachedCommitView(oid, lookup(oid));
+    if (!commit) continue;
+    for (const parent of commit.parents) {
       if (!distance.has(parent)) {
         distance.set(parent, d + 1);
         queue.push(parent);
@@ -606,9 +672,9 @@ export function fetchPlan(
   if (depth !== undefined) {
     for (const oid of included) {
       if ((distance.get(oid) as number) !== depth - 1) continue;
-      const object = lookup(oid);
-      if (!object || object.type !== 'commit') continue;
-      if (parseCommit(object.data).parents.length > 0) shallow.push(oid);
+      const commit = cachedCommitView(oid, lookup(oid));
+      if (!commit) continue;
+      if (commit.parents.length > 0) shallow.push(oid);
     }
     shallow.sort();
   }
@@ -616,10 +682,9 @@ export function fetchPlan(
   const unshallow: string[] = [];
   for (const old of options.shallow ?? []) {
     if (!included.has(old)) continue;
-    const object = lookup(old);
-    if (!object || object.type !== 'commit') continue;
-    const parents = parseCommit(object.data).parents;
-    if (parents.every((parent) => included.has(parent))) unshallow.push(old);
+    const commit = cachedCommitView(old, lookup(old));
+    if (!commit) continue;
+    if (commit.parents.every((parent) => included.has(parent))) unshallow.push(old);
   }
   unshallow.sort();
 
@@ -628,12 +693,12 @@ export function fetchPlan(
   for (const oid of extraWants) send.add(oid);
   for (const oid of included) {
     send.add(oid);
-    const object = lookup(oid);
-    if (!object || object.type !== 'commit') continue;
-    const tree = parseCommit(object.data).tree;
-    const flat = flattenTree(tree, lookup);
+    const commit = cachedCommitView(oid, lookup(oid));
+    if (!commit) continue;
+    const tree = commit.tree;
     send.add(tree);
-    // Add every subtree oid as well (flatten only lists blobs; walk the tree objects too).
+    // One walk of the tree: collect every subtree oid and every blob entry oid.
+    // (flattenTree plus a second subtree walk used to parse each tree object twice.)
     const treeQueue = [tree];
     const seenTrees = new Set<string>([tree]);
     while (treeQueue.length) {
@@ -641,14 +706,18 @@ export function fetchPlan(
       const treeObject = lookup(treeOid);
       if (!treeObject || treeObject.type !== 'tree') continue;
       for (const entry of parseTree(treeObject.data)) {
-        if (entry.mode === '40000' && !seenTrees.has(entry.oid)) {
-          seenTrees.add(entry.oid);
+        if (entry.mode === '160000') continue;
+        if (entry.mode === '40000') {
+          if (!seenTrees.has(entry.oid)) {
+            seenTrees.add(entry.oid);
+            send.add(entry.oid);
+            treeQueue.push(entry.oid);
+          }
+        } else {
           send.add(entry.oid);
-          treeQueue.push(entry.oid);
         }
       }
     }
-    for (const entry of flat.values()) send.add(entry.oid);
   }
   // Subtract what the client already has. A shallow boundary is a cut: the client holds
   // the boundary commit and its tree, but none of its ancestors, so the parents of a
